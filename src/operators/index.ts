@@ -385,6 +385,9 @@ export class OperatorAgent extends EventEmitter<OperatorEvents> {
     return this._state.status === 'burned';
   }
 
+  /** Incremented by abortActiveTask() so runs started before the abort can tell they were abandoned. */
+  private abortEpoch = 0;
+
   /**
    * Assign a task to the operator
    */
@@ -393,6 +396,11 @@ export class OperatorAgent extends EventEmitter<OperatorEvents> {
     if (!this.isAvailable()) {
       throw new Error(`Operator ${this.callsign} is not available (status: ${this._state.status})`);
     }
+
+    // Once abortActiveTask() runs, this operator may already be working on something else, so
+    // this invocation must not touch its state or start more work.
+    const epoch = this.abortEpoch;
+    const abandoned: TaskResult = { success: false, error: 'run abandoned by dispatch backstop' };
 
     this.setStatus('tasked');
     this._state.currentTask = task.id;
@@ -403,6 +411,7 @@ export class OperatorAgent extends EventEmitter<OperatorEvents> {
     try {
       this.setStatus('executing');
       const result = await this.executeTask(task, target);
+      if (epoch !== this.abortEpoch) return abandoned;
 
       this._state.completedTasks++;
       this._state.currentTask = null;
@@ -414,6 +423,8 @@ export class OperatorAgent extends EventEmitter<OperatorEvents> {
 
       return result;
     } catch (error) {
+      if (epoch !== this.abortEpoch) return abandoned;
+
       this._state.failedTasks++;
       this._state.currentTask = null;
 
@@ -424,6 +435,7 @@ export class OperatorAgent extends EventEmitter<OperatorEvents> {
       const attempt = (task as any)._decomposeAttempt || 0;
       if (this.llm && attempt < this.config.maxRetries) {
         const subtasks = await this.decomposeTask(task, errorMessage);
+        if (epoch !== this.abortEpoch) return abandoned;
         if (subtasks.length > 0) {
           this.emit('task:decomposed', { parent: task, subtasks, reason: errorMessage });
           this.setStatus('idle');
@@ -432,6 +444,7 @@ export class OperatorAgent extends EventEmitter<OperatorEvents> {
           for (const sub of subtasks) {
             (sub as any)._decomposeAttempt = attempt + 1;
             const r = await this.assignTask(sub, target);
+            if (epoch !== this.abortEpoch) return abandoned;
             subResults.push(r);
           }
 
@@ -509,19 +522,25 @@ export class OperatorAgent extends EventEmitter<OperatorEvents> {
     // Pass the white-box source excerpt (if any) so the model sees the target's
     // real source alongside the task; empty string keeps black-box behavior.
     if (this.agentLoop && this.llm) {
+      // Any of these means the run is alive: the dispatch backstop measures silence from here.
+      const touch = (): void => { this._state.lastActivityTime = Date.now(); };
       const onThinking = ({ content }: { content: string }): void => {
+        touch();
         this.emit('agent:thinking', { task, content });
       };
       const onToolCall = ({ name, args, source }: { name: string; args: Record<string, unknown>; source?: 'agent' | 'backend_seeded' }): void => {
+        touch();
         this.emit('agent:tool_call', { task, name, args, source });
       };
       const onToolResult = ({ name, result, source }: { name: string; result: ToolResult; source?: 'agent' | 'backend_seeded' }): void => {
+        touch();
         this.emit('agent:tool_result', { task, name, result, source });
       };
       const canForwardAgentEvents =
         typeof this.agentLoop.on === 'function' &&
         typeof this.agentLoop.off === 'function';
       if (canForwardAgentEvents) {
+        this.agentLoop.on('agent:iteration', touch);
         this.agentLoop.on('agent:thinking', onThinking);
         this.agentLoop.on('agent:tool_call', onToolCall);
         this.agentLoop.on('agent:tool_result', onToolResult);
@@ -549,6 +568,7 @@ export class OperatorAgent extends EventEmitter<OperatorEvents> {
       } finally {
         if (routedLLM && this.agentLoop) this.agentLoop.setLLM(this.llm);
         if (canForwardAgentEvents) {
+          this.agentLoop.off('agent:iteration', touch);
           this.agentLoop.off('agent:thinking', onThinking);
           this.agentLoop.off('agent:tool_call', onToolCall);
           this.agentLoop.off('agent:tool_result', onToolResult);
@@ -843,6 +863,9 @@ Respond in a structured format.`;
    * recorded are preserved.
    */
   abortActiveTask(reason: string): void {
+    this.abortEpoch++;
+    this.agentLoop?.cancel?.(reason);
+
     // Nothing to abort if the operator isn't holding a task.
     if (this._state.status === 'idle' || this._state.status === 'burned' || this._state.status === 'exfiltrated') {
       return;

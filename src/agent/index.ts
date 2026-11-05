@@ -108,6 +108,8 @@ export interface AgentResult {
 
 export interface AgentEvents {
   'agent:step': AgentStep;
+  /** Fired at the top of every iteration: the liveness signal for the dispatch backstop. */
+  'agent:iteration': { iteration: number };
   'agent:tool_call': { name: string; args: Record<string, unknown>; source?: 'agent' | 'backend_seeded' };
   'agent:tool_result': { name: string; result: ToolResult; source?: 'agent' | 'backend_seeded' };
   'agent:thinking': { content: string };
@@ -120,14 +122,38 @@ export interface AgentEvents {
 // AGENT LOOP
 // =============================================================================
 
+/**
+ * Settle as soon as `signal` aborts, even if `work` never does. Only some LLM adapters honor
+ * an abort signal, so a cancelled run can't rely on the provider to let go of it.
+ */
+function raceAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new Error('run cancelled'));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(work)
+      .then(resolve, reject)
+      .finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
 export class AgentLoop extends EventEmitter<AgentEvents> {
   private llm: LLMBackbone;
   private arsenal: Arsenal;
   private options: Required<AgentLoopOptions>;
+  private activeRun: AbortController | null = null;
 
   /** Swap the LLM this loop drives (phase-based model routing). */
   setLLM(llm: LLMBackbone): void {
     this.llm = llm;
+  }
+
+  /**
+   * Stop the current run: abort its in-flight LLM call and start no further iterations or
+   * tools. A tool already executing finishes on its own timeout, but its result is discarded.
+   */
+  cancel(reason: string): void {
+    this.activeRun?.abort(reason);
   }
 
   constructor(llm: LLMBackbone, arsenal: Arsenal, options?: AgentLoopOptions) {
@@ -163,6 +189,19 @@ export class AgentLoop extends EventEmitter<AgentEvents> {
     // anti-stall: dedup identical tool calls + detect runs of no-new-findings (ported from the hunter)
     const seenCalls = new Map<string, string>();
     let noProgress = 0;
+    const controller = new AbortController();
+    this.activeRun = controller;
+    const { signal } = controller;
+    const cancelledResult = (iterations: number): AgentResult => ({
+      success: false,
+      summary: `Run cancelled: ${String(signal.reason)}`,
+      steps,
+      findings: allFindings,
+      iterations,
+      tokensUsed,
+      durationMs: Date.now() - startTime,
+      hitLimit: false,
+    });
 
     // Get tool definitions from Arsenal (the operator's role toolkit: name allowlist wins,
     // then category filter, then all).
@@ -211,12 +250,15 @@ export class AgentLoop extends EventEmitter<AgentEvents> {
     }
 
     for (let i = 0; i < this.options.maxIterations; i++) {
+      if (signal.aborted) return cancelledResult(i);
+      this.emit('agent:iteration', { iteration: i });
       try {
         // Ask the LLM what to do next
-        const response = await this.llm.chatWithTools(messages, toolDefs, {
+        const response = await raceAbort(this.llm.chatWithTools(messages, toolDefs, {
           maxTokens: 4096,
           temperature: 0.3, // Lower temperature for tool-using tasks
-        });
+          signal,
+        }), signal);
 
         tokensUsed += response.usage?.totalTokens || 0;
 
@@ -361,6 +403,7 @@ export class AgentLoop extends EventEmitter<AgentEvents> {
           break;
         }
       } catch (error) {
+        if (signal.aborted) return cancelledResult(i);
         this.emit('agent:error', { error: error as Error, step: i });
 
         // On error, try to continue with a reduced context
@@ -372,6 +415,8 @@ export class AgentLoop extends EventEmitter<AgentEvents> {
       }
     }
 
+    if (signal.aborted) return cancelledResult(this.options.maxIterations);
+
     // Hit iteration or token limit — ask LLM for a final summary
     hitLimit = true;
     messages.push({
@@ -382,7 +427,7 @@ export class AgentLoop extends EventEmitter<AgentEvents> {
     let summary = 'Agent reached iteration limit without producing a final summary.';
     let finalSummaryError: string | undefined;
     try {
-      const finalResponse = await this.llm.chat(messages, { maxTokens: 2048 });
+      const finalResponse = await raceAbort(this.llm.chat(messages, { maxTokens: 2048, signal }), signal);
       summary = finalResponse.content;
       tokensUsed += finalResponse.usage?.totalTokens || 0;
       // capture the structured debrief from the limit-summary too (same contract as the clean finish)

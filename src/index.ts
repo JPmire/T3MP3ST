@@ -226,7 +226,7 @@ import { OperatorCell, OperatorAgent, ARCHETYPE_PROFILES, PHASE_ARCHETYPES, KILL
 import { PackBoard } from './pack/board.js';
 import { randomUUID } from 'node:crypto';
 import { createPrivateReportWorkspace, readPrivateToolReport } from './arsenal/report-workspace.js';
-import { MissionControl, TaskQueue } from './mission/index.js';
+import { MAX_TASK_RETRIES, MissionControl, TaskQueue } from './mission/index.js';
 import { TargetEnvironment } from './target/index.js';
 import { EvidenceVault } from './evidence/index.js';
 import {
@@ -275,6 +275,8 @@ import {
 // TEMPEST COMMAND
 // =============================================================================
 
+/** Ticks (seconds) that pending work may sit undispatchable with nothing running before the mission stalls. */
+const BLOCKED_STALL_TICKS = 30;
 const DEFAULT_AGENT_MAX_ITERATIONS = 15;
 const LOCAL_AGENT_MAX_ITERATIONS = Number(process.env.T3MP3ST_LOCAL_AGENT_MAX_ITERATIONS || 30);
 const MAX_PROGRESS_EVENTS = 300;
@@ -339,6 +341,7 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
   private tickCount: number = 0;
   private hooks: RuntimeHooks;
   private readonly taskTimeoutMs: number;
+  private readonly taskMaxMs: number;
 
   /**
    * White-box source context (security-prioritized code excerpt), set by the
@@ -374,6 +377,7 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
     this.name = config.name;
     this.hooks = config.hooks || {};
     this.taskTimeoutMs = TempestCommand.resolveTaskTimeoutMs(config.llm.provider);
+    this.taskMaxMs = TempestCommand.resolveTaskMaxMs(this.taskTimeoutMs);
 
     // Initialize LLM backbone
     this.llmConfig = config.llm;
@@ -883,6 +887,7 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
   public pause(): void {
     if (!this.running || this.paused) return;
     this.paused = true;
+    this.pausedAt = Date.now();
     this.emit('command:paused');
   }
 
@@ -891,9 +896,37 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
    */
   public resume(): void {
     if (!this.running || !this.paused) return;
+    const wasStalled = this.stallReason !== null;
     this.paused = false;
     this.stallReason = null;
+    this.blockedTicks = 0;
+
+    // Time spent paused doesn't count against in-flight work: push the hard ceiling out by the
+    // pause and give each dispatch a fresh inactivity window.
+    const now = Date.now();
+    if (this.pausedAt !== null) {
+      const pausedFor = now - this.pausedAt;
+      for (const [taskId, startedAt] of this.dispatchStartTimes) {
+        this.dispatchStartTimes.set(taskId, startedAt + pausedFor);
+      }
+      this.pausedAt = null;
+    }
+    this.lastResumedAt = now;
+
+    // A failed task would re-stall on the next tick, so resuming from a stall means retrying it.
+    // TaskQueue.retry() enforces the bound. A hand-paused mission keeps its failures as they are.
+    if (wasStalled && !this.opsec.isAbortRecommended()) this.requeueFailedCurrentPhaseTasks();
+
     this.emit('command:resumed');
+  }
+
+  private requeueFailedCurrentPhaseTasks(): void {
+    const mission = this.mission.getActiveMission();
+    const taskQueue = this.mission.getTaskQueue();
+    if (!mission || !taskQueue) return;
+    for (const task of taskQueue.getForMission(mission.id)) {
+      if (task.phase === mission.currentPhase && task.status === 'failed') taskQueue.retry(task.id);
+    }
   }
 
   /**
@@ -934,29 +967,47 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
   private dispatchOperators: Map<string, OperatorAgent> = new Map();
 
   /**
-   * GENEROUS per-dispatch wall-clock backstop (ms). If a single task dispatch stays
-   * in-flight longer than this, the tick loop force-resolves it as a timeout so
-   * pendingOrActive can reach 0 and the mission can advance/complete even when an
-   * operator promise wedges. Deliberately large (default 5 min for API models,
-   * 30 min for local-agent backends) so it does not kill legitimately slow local
-   * CLI work; it only fires on truly-hung dispatches. Override via
-   * T3MP3ST_TASK_TIMEOUT_MS.
+   * Identifies the current dispatch of each task. A re-queued task is dispatched again under the
+   * same task id, so a late result from the earlier attempt must be told apart by this id.
    */
+  private dispatchIds: Map<string, number> = new Map();
+  private nextDispatchId = 0;
+
+  /** When pause() was called, and when the mission last resumed (see checkDispatchTimeouts). */
+  private pausedAt: number | null = null;
+  private lastResumedAt = 0;
+
+  /** Consecutive ticks with pending work, nothing dispatched, and no operator working. */
+  private blockedTicks = 0;
+
   private progressEvents: ScanProgressEvent[] = [];
 
+  private static envPositiveNumber(name: string): number | undefined {
+    const raw = process.env[name];
+    if (raw === undefined || raw.trim() === '') return undefined;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  }
+
   /**
-   * Resolve the dispatch timeout from the environment, falling back to the
-   * provider-specific default. Guards against a non-numeric / non-positive override.
+   * How long a dispatch may go without reporting ANY activity before it is treated as hung:
+   * 5 min for API models, 30 min for local-agent backends, or T3MP3ST_TASK_TIMEOUT_MS. A run
+   * that keeps iterating is never reaped by this, however long it takes overall.
    */
   private static resolveTaskTimeoutMs(provider?: LLMProvider): number {
-    const DEFAULT_TASK_TIMEOUT_MS = 300000; // 5 minutes — generous backstop, not a deadline
+    const DEFAULT_TASK_TIMEOUT_MS = 300000;
     const LOCAL_AGENT_TASK_TIMEOUT_MS = 1800000; // local CLI agents can need multiple slow turns
-    const raw = process.env.T3MP3ST_TASK_TIMEOUT_MS;
-    if (raw != null && raw.trim() !== '') {
-      const parsed = Number(raw);
-      if (Number.isFinite(parsed) && parsed > 0) return parsed;
-    }
-    return provider === 'local-agent' ? LOCAL_AGENT_TASK_TIMEOUT_MS : DEFAULT_TASK_TIMEOUT_MS;
+    return TempestCommand.envPositiveNumber('T3MP3ST_TASK_TIMEOUT_MS')
+      ?? (provider === 'local-agent' ? LOCAL_AGENT_TASK_TIMEOUT_MS : DEFAULT_TASK_TIMEOUT_MS);
+  }
+
+  /**
+   * Hard ceiling on one dispatch, active or not: T3MP3ST_TASK_MAX_MS, or 4x the inactivity
+   * timeout. Never shorter than the inactivity timeout.
+   */
+  private static resolveTaskMaxMs(timeoutMs: number): number {
+    const configured = TempestCommand.envPositiveNumber('T3MP3ST_TASK_MAX_MS');
+    return configured !== undefined ? Math.max(configured, timeoutMs) : timeoutMs * 4;
   }
 
   /** Track whether we've seeded initial tasks for the current mission */
@@ -976,6 +1027,7 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
 
     // Check OPSEC status
     if (this.opsec.isAbortRecommended()) {
+      this.stallReason = 'OPSEC abort recommended: detection limit reached — review detections before resuming';
       this.pause();
       return;
     }
@@ -1026,8 +1078,10 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
       );
       if (failedCurrentPhase.length > 0) {
         const firstError = failedCurrentPhase[0].result?.error;
+        const canRetry = failedCurrentPhase.some(t => (t.retryCount ?? 0) < MAX_TASK_RETRIES);
         this.stallReason = `stalled in ${mission.currentPhase}: ${failedCurrentPhase.length} required task(s) failed` +
-          (firstError ? ` — ${firstError}` : '');
+          (firstError ? ` — ${firstError}` : '') +
+          (canRetry ? ' — resume to retry' : ' — retries exhausted; stop the mission to write its report');
         this.paused = true;
         this.emit('command:paused');
         return;
@@ -1062,7 +1116,13 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
 
     // ── Dispatch pending tasks to idle operators ──
     const pendingTasks = taskQueue.getPending();
-    if (pendingTasks.length === 0) return;
+    if (pendingTasks.length === 0) {
+      this.blockedTicks = 0;
+      return;
+    }
+
+    let dispatched = 0;
+    let blockedBy: string | null = null;
 
     for (const task of pendingTasks) {
       // Skip if already being dispatched
@@ -1073,21 +1133,26 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
         .filter(op => op.archetype === task.operatorType && op.isAvailable());
       let operator = availableOps[0];
 
-      // Auto-spawn an operator if none exists for this archetype
+      // Auto-spawn an operator if none exists for this archetype. Burned operators don't count
+      // towards the cap: they will never take work again.
       if (!operator) {
-        if (this.llm.getProvider() === 'local-agent') continue;
-        const allOps = this.cell.getAllOperators();
-        const archetypeCount = allOps.filter(op => op.archetype === task.operatorType).length;
-        // Spawn up to 3 operators per archetype for parallelism
-        if (archetypeCount < 3) {
-          const callsign = `${task.operatorType.charAt(0).toUpperCase() + task.operatorType.slice(1)}-${archetypeCount + 1}`;
+        const sameArchetype = this.cell.getAllOperators().filter(op => op.archetype === task.operatorType);
+        const liveCount = sameArchetype.filter(op => !op.isBurned() && op.status !== 'exfiltrated').length;
+        // Up to 3 per archetype for parallelism. Local-agent backends share one CLI and pre-spawn
+        // what the caller asked for, so they only get an operator for an archetype with none.
+        const cap = this.llm.getProvider() === 'local-agent' ? 1 : 3;
+        if (liveCount < cap) {
+          const callsign = `${task.operatorType.charAt(0).toUpperCase() + task.operatorType.slice(1)}-${sameArchetype.length + 1}`;
           // spawnOperator throws when the pool is at capacity or the callsign collides —
           // treat that as "no operator available right now" and defer (operator stays unset),
           // never crash the tick.
           try { operator = this.spawnOperator(callsign, task.operatorType); }
           catch { /* pool full / dup callsign — dispatch skipped by the !operator guard below */ }
         }
-        if (!operator) continue;
+        if (!operator) {
+          blockedBy ??= `no available '${task.operatorType}' operator`;
+          continue;
+        }
       }
 
       // Check task dependencies are met
@@ -1096,7 +1161,10 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
           const dep = taskQueue.getTask(depId);
           return dep?.status === 'completed';
         });
-        if (!allDepsComplete) continue;
+        if (!allDepsComplete) {
+          blockedBy ??= `unmet dependencies on '${task.name}'`;
+          continue;
+        }
       }
 
       // Match task to target by address in the task description.
@@ -1105,22 +1173,28 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
       // activeDispatches with no completion path to clear it).
       const allTargets = this.targetEnv.getAllTargets();
       const target = allTargets.find(t => task.description.includes(t.address)) || allTargets[0];
-      if (!target) continue; // No targets available — leave task pending, skip dispatch
+      if (!target) { // No targets available — leave task pending, skip dispatch
+        blockedBy ??= 'no targets available';
+        continue;
+      }
 
       // Dispatch task (fire and forget — don't block the tick loop)
+      dispatched++;
       this.activeDispatches.add(task.id);
       // Record wall-clock start + owning operator so checkDispatchTimeouts() can reap
       // this exact dispatch if its promise never settles.
       this.dispatchStartTimes.set(task.id, Date.now());
       this.dispatchOperators.set(task.id, operator);
+      const dispatchId = ++this.nextDispatchId;
+      this.dispatchIds.set(task.id, dispatchId);
       taskQueue.assign(task.id, operator.id);
 
       // Execute asynchronously
       operator.assignTask(task, target).then((result) => {
-        // If the backstop already reaped this dispatch, activeDispatches no longer
-        // has it — skip so we don't clobber the timed-out task's terminal state or
-        // double-fire the completion hook.
-        if (!this.activeDispatches.has(task.id)) return;
+        // If the backstop already reaped this dispatch, skip so we don't clobber the
+        // timed-out task's terminal state, a retry now running under the same task id,
+        // or double-fire the completion hook.
+        if (this.dispatchIds.get(task.id) !== dispatchId) return;
         this.clearDispatch(task.id);
         if (result.success === false) {
           taskQueue.fail(task.id, result.error || result.output || 'task returned unsuccessful result');
@@ -1129,7 +1203,7 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
           this.hooks.onTaskCompleted?.(task);
         }
       }).catch((_error) => {
-        if (!this.activeDispatches.has(task.id)) return;
+        if (this.dispatchIds.get(task.id) !== dispatchId) return;
         this.clearDispatch(task.id);
         try {
           taskQueue.fail(task.id, _error instanceof Error ? _error.message : String(_error));
@@ -1137,6 +1211,20 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
           // Swallow — task may already be in a terminal state
         }
       });
+    }
+
+    // Pending work that nothing is able to pick up would otherwise wait forever with no
+    // explanation. A busy operator may still free things up, so only count ticks with none.
+    const anyoneWorking = this.activeDispatches.size > 0 || this.cell.getAllOperators().some(
+      op => op.status === 'tasked' || op.status === 'executing' || op.status === 'cooldown'
+    );
+    if (dispatched > 0 || anyoneWorking) {
+      this.blockedTicks = 0;
+    } else if (++this.blockedTicks >= BLOCKED_STALL_TICKS) {
+      this.stallReason = `stalled in ${mission.currentPhase}: ${pendingTasks.length} pending task(s) cannot be dispatched` +
+        (blockedBy ? ` — ${blockedBy}` : '');
+      this.paused = true;
+      this.emit('command:paused');
     }
   }
 
@@ -1148,6 +1236,7 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
     this.activeDispatches.delete(taskId);
     this.dispatchStartTimes.delete(taskId);
     this.dispatchOperators.delete(taskId);
+    this.dispatchIds.delete(taskId);
   }
 
   /**
@@ -1161,17 +1250,16 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
    * never advances, and completeMission() is never called: the mission HANGS.
    *
    * On every tick we scan the in-flight dispatches and force-resolve any that have
-   * exceeded the GENEROUS wall-clock backstop (taskTimeoutMs), or that exhibit
-   * the exact wedge symptom (owning operator is `executing`/`tasked`
-   * but its currentTask is null — i.e. it has silently dropped the task). For each
-   * we: (1) mark the task failed/timed-out in the queue, (2) clear its dispatch
-   * bookkeeping, and (3) reset the owning operator back to idle so it can take new
-   * work. That lets pendingOrActive reach 0 and the phase advance / mission finish.
+   * reported no activity for taskTimeoutMs, or that have run past the taskMaxMs hard
+   * ceiling. For each we: (1) mark the task failed/timed-out in the queue, (2) clear its
+   * dispatch bookkeeping, (3) cancel the run and reset the owning operator back to idle so
+   * it can take new work, and (4) re-queue the task if it hasn't been retried yet, since a
+   * hang is often transient. If it hangs again, the mission stalls for the operator.
    *
-   * This is a backstop, not a deadline: the timeout is large enough that a slow but
-   * genuinely-working task is never killed. Normal completion is untouched — if the
-   * wedged promise later settles, its then/catch sees the dispatch already gone and
-   * no-ops (see the guards in tick()).
+   * This is a backstop, not a deadline: a slow task that keeps iterating is left alone
+   * until the ceiling. Normal completion is untouched — if the wedged promise later
+   * settles, its then/catch sees a different dispatch id and no-ops (see the guards in
+   * tick()).
    */
   private checkDispatchTimeouts(taskQueue: TaskQueue): void {
     if (this.activeDispatches.size === 0) return;
@@ -1183,22 +1271,23 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
       const operator = this.dispatchOperators.get(taskId);
 
       const elapsed = startedAt != null ? now - startedAt : Number.POSITIVE_INFINITY;
-      const overTime = elapsed >= this.taskTimeoutMs;
+      const lastSignOfLife = Math.max(startedAt ?? 0, operator?.state.lastActivityTime ?? 0, this.lastResumedAt);
+      const silent = now - lastSignOfLife >= this.taskTimeoutMs;
+      const overCeiling = elapsed >= this.taskMaxMs;
+
+      if (!silent && !overCeiling) continue;
 
       // Wedge symptom: operator claims to be working (executing/tasked) but has no
-      // current task — the promise silently dropped it. Only treat this as a wedge
-      // once the backstop window has elapsed, so a normal in-between-status tick
-      // (e.g. the brief gap before currentTask is set) is never misread as hung.
+      // current task — the promise silently dropped it.
       const wedged = operator != null &&
         (operator.status === 'executing' || operator.status === 'tasked') &&
-        operator.state.currentTask == null &&
-        overTime;
-
-      if (!overTime && !wedged) continue;
+        operator.state.currentTask == null;
 
       const reason = wedged
         ? `dispatch wedged: operator ${operator?.id ?? 'unknown'} stuck in '${operator?.status}' with no current task for ${Math.round(elapsed / 1000)}s`
-        : `dispatch timed out after ${Math.round(elapsed / 1000)}s (backstop ${Math.round(this.taskTimeoutMs / 1000)}s)`;
+        : overCeiling
+          ? `dispatch timed out after ${Math.round(elapsed / 1000)}s (hard limit ${Math.round(this.taskMaxMs / 1000)}s)`
+          : `dispatch timed out after ${Math.round((now - lastSignOfLife) / 1000)}s without activity (backstop ${Math.round(this.taskTimeoutMs / 1000)}s)`;
 
       // Clear a CLEAR event/log so a timed-out dispatch is never silent.
       console.warn(`[T3MP3ST] task ${taskId} force-resolved as timeout — ${reason}`);
@@ -1215,8 +1304,11 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
       // 2) Drop it from in-flight bookkeeping so inFlight/activeDispatches shrink.
       this.clearDispatch(taskId);
 
-      // 3) Reset the wedged operator back to idle so it can pick up new work.
+      // 3) Cancel the run and reset the wedged operator back to idle so it can pick up new work.
       operator?.abortActiveTask(reason);
+
+      // 4) Give a first-time hang one automatic retry.
+      if ((taskQueue.getTask(taskId)?.retryCount ?? 0) === 0) taskQueue.retry(taskId);
     }
   }
 

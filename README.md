@@ -86,8 +86,15 @@ your API key authenticates those requests. Review Novita's current
 data. T3MP3ST does not claim independent assurance for sensitive workloads.
 
 Slow local agents can be given more room with `T3MP3ST_LOCAL_AGENT_TIMEOUT_MS`
-for each CLI call, `T3MP3ST_TASK_TIMEOUT_MS` for mission tasks, and
-`T3MP3ST_GENERAL_TIMEOUT_MS` for planning requests. Values are milliseconds.
+for each CLI call, `T3MP3ST_TASK_TIMEOUT_MS` for how long a mission task may go
+without activity, `T3MP3ST_TASK_MAX_MS` for a mission task's total runtime
+(default 4x the task timeout), and `T3MP3ST_GENERAL_TIMEOUT_MS` for planning
+requests. Values are milliseconds.
+
+A mission stalls instead of advancing when a required task fails. Resuming a
+stalled mission retries its failed tasks, up to three times per task; a task
+that hangs is retried once automatically first. The stall reason says when
+retries have run out.
 
 Claude Code session reuse is disabled by default because a resumed coding-agent
 session may retain provider-side context and ambient tool authority outside the
