@@ -88,7 +88,8 @@ data. T3MP3ST does not claim independent assurance for sensitive workloads.
 Slow local agents can be given more room with `T3MP3ST_LOCAL_AGENT_TIMEOUT_MS`
 for each CLI call, `T3MP3ST_TASK_TIMEOUT_MS` for how long a mission task may go
 without activity, `T3MP3ST_TASK_MAX_MS` for a mission task's total runtime
-(default 4x the task timeout), and `T3MP3ST_GENERAL_TIMEOUT_MS` for planning
+(default 4x the task timeout), `T3MP3ST_DNS_TIMEOUT_MS` for each DNS resolver
+operation (default 10 seconds), and `T3MP3ST_GENERAL_TIMEOUT_MS` for planning
 requests. Values are milliseconds.
 
 A mission stalls instead of advancing when a required task fails. Resuming a

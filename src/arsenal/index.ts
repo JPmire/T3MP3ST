@@ -44,6 +44,32 @@ const dnsResolveNs = promisify(dns.resolveNs);
 const dnsReverse = promisify(dns.reverse);
 const dnsResolveCname = promisify(dns.resolveCname);
 
+const DEFAULT_DNS_TIMEOUT_MS = 10_000;
+
+function resolveDnsTimeoutMs(): number {
+  const raw = process.env.T3MP3ST_DNS_TIMEOUT_MS;
+  if (raw?.trim()) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return DEFAULT_DNS_TIMEOUT_MS;
+}
+
+async function withDnsTimeout<T>(operation: Promise<T>, domain: string): Promise<T> {
+  const timeoutMs = resolveDnsTimeoutMs();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`DNS lookup timed out after ${Math.ceil(timeoutMs / 1000)}s for ${domain}`));
+      }, timeoutMs);
+      operation.then(resolve, reject);
+    });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 import { CVE_DATABASE } from '../stubs/index.js';
 import type { CVEEntry } from '../stubs/index.js';
 
@@ -625,25 +651,25 @@ export const BUILTIN_TOOLS: CustomTool[] = [
 
         switch (recordType) {
           case 'A':
-            records = await dnsResolve4(domain);
+            records = await withDnsTimeout(dnsResolve4(domain), domain);
             break;
           case 'MX': {
-            const mxRecords = await dnsResolveMx(domain);
+            const mxRecords = await withDnsTimeout(dnsResolveMx(domain), domain);
             records = mxRecords.map(r => `${r.priority} ${r.exchange}`);
             break;
           }
           case 'TXT': {
-            const txtRecords = await dnsResolveTxt(domain);
+            const txtRecords = await withDnsTimeout(dnsResolveTxt(domain), domain);
             records = txtRecords.map(r => r.join(''));
             break;
           }
           case 'NS':
-            records = await dnsResolveNs(domain);
+            records = await withDnsTimeout(dnsResolveNs(domain), domain);
             break;
           default: {
             // dns.resolve returns an array for most rrtypes, but a single object
             // for SOA (and other structured types) — normalize before joining.
-            const raw = await dnsResolve(domain, recordType);
+            const raw = await withDnsTimeout(dnsResolve(domain, recordType), domain);
             records = Array.isArray(raw) ? (raw as unknown as string[]) : [JSON.stringify(raw)];
           }
         }
@@ -749,7 +775,7 @@ export const BUILTIN_TOOLS: CustomTool[] = [
           batch.map(async (prefix) => {
             const subdomain = `${prefix}.${domain}`;
             try {
-              const addresses = await dnsResolve4(subdomain);
+              const addresses = await withDnsTimeout(dnsResolve4(subdomain), subdomain);
               return { subdomain, ip: addresses[0], found: true };
             } catch {
               return { subdomain, ip: '', found: false };
@@ -1875,7 +1901,7 @@ ${issues.length ? `Issues:\n${issues.join('\n')}` : '✓ No obvious issues'}`,
       }
 
       try {
-        const hostnames = await dnsReverse(ip);
+        const hostnames = await withDnsTimeout(dnsReverse(ip), ip);
 
         if (hostnames.length === 0) {
           return {
@@ -1938,7 +1964,7 @@ ${issues.length ? `Issues:\n${issues.join('\n')}` : '✓ No obvious issues'}`,
       const chain: string[] = [];
       let cname: string | null = null;
       try {
-        const cnames = await dnsResolveCname(target);
+        const cnames = await withDnsTimeout(dnsResolveCname(target), target);
         if (cnames.length) { chain.push(...cnames); cname = cnames[cnames.length - 1]; }
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
@@ -1951,8 +1977,8 @@ ${issues.length ? `Issues:\n${issues.join('\n')}` : '✓ No obvious issues'}`,
       // 2) Does the CNAME target still resolve? A dangling (non-resolving) CNAME is a strong signal.
       let cnameResolves = false;
       if (cname) {
-        try { cnameResolves = (await dnsResolve4(cname)).length > 0; }
-        catch { try { cnameResolves = (await dnsResolve(cname, 'AAAA') as string[]).length > 0; } catch { cnameResolves = false; } }
+        try { cnameResolves = (await withDnsTimeout(dnsResolve4(cname), cname)).length > 0; }
+        catch { try { cnameResolves = (await withDnsTimeout(dnsResolve(cname, 'AAAA'), cname) as string[]).length > 0; } catch { cnameResolves = false; } }
       }
 
       // 3) Best-effort fetch of the live response to confirm an "unclaimed resource" fingerprint.
@@ -2137,7 +2163,7 @@ ${issues.length ? `Issues:\n${issues.join('\n')}` : '✓ No obvious issues'}`,
       // Resolve host to IP first
       let targetIp: string;
       try {
-        const addresses = await dnsResolve4(host);
+        const addresses = await withDnsTimeout(dnsResolve4(host), host);
         targetIp = addresses[0];
       } catch {
         targetIp = host; // Assume it's already an IP
